@@ -21,6 +21,10 @@ from pydantic_ai.models import ModelSettings, EitherStreamedResponse, Model, Age
 from pydantic_ai.usage import Usage
 from gen_ai_hub.proxy.native.amazon.clients import Session
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 try:
     from gen_ai_hub.proxy import get_proxy_client
     from gen_ai_hub.proxy.core.utils import NOT_GIVEN
@@ -144,7 +148,7 @@ class AnthropicAgentModel(AgentModel):
         Returns:
             A tuple of (response, usage)
         """
-        print(f"Request messages: {messages}")
+        logger.debug(f"Request messages: {messages}")
         response = self._messages_create(messages, False, model_settings)
         return self._process_response(response)
 
@@ -171,7 +175,7 @@ class AnthropicAgentModel(AgentModel):
             The API response
         """
         mapped_messages = self._map_messages(messages)
-        print(f"Creating message with: {mapped_messages}")
+        logger.debug(f"Creating message with: {mapped_messages}")
         
         # Convert mapped messages to the format expected by AWS Bedrock
         messages = []
@@ -209,16 +213,16 @@ class AnthropicAgentModel(AgentModel):
                 ]
             }
 
-        print(f"Request kwargs: {request_kwargs}")
+        logger.debug(f"Request kwargs: {request_kwargs}")
         
         # Make the API call through AWS Bedrock
         try:
             response = self.client.converse(**request_kwargs)
-            print(f"Response from Claude: {response}")
+            logger.debug(f"Response from Claude: {response}")
             return response
             
         except Exception as e:
-            print(f"Error calling Claude: {str(e)}")
+            logger.error(f"Error calling Claude: {str(e)}")
             raise
 
     def _process_response(
@@ -232,7 +236,7 @@ class AnthropicAgentModel(AgentModel):
         Returns:
             A tuple of (response, usage)
         """
-        print(f"Processing response: {response}")
+        logger.debug(f"Processing response: {response}")
 
         # Extract the response content
         output = response.get("output", {})
@@ -248,19 +252,19 @@ class AnthropicAgentModel(AgentModel):
                 parts.append(TextPart(content=content["text"]))
             elif "toolUse" in content:
                 tool_use = content["toolUse"]
-                print(f"Processing tool use: {tool_use}")
-                print(f"Tool name: {tool_use['name']}")
-                print(f"Tool input: {tool_use['input']}")
-                print(f"Tool input type: {type(tool_use['input'])}")
+                logger.debug(f"Processing tool use: {tool_use}")
+                logger.debug(f"Tool name: {tool_use['name']}")
+                logger.debug(f"Tool input: {tool_use['input']}")
+                logger.debug(f"Tool input type: {type(tool_use['input'])}")
                 
                 tool_part = ToolCallPart.from_raw_args(
                     tool_use["name"],
                     dumps(tool_use["input"]),  # Convert dict to JSON string
                     tool_use.get("toolUseId", ""),
                 )
-                print(f"Created ToolCallPart: {tool_part}")
-                print(f"ToolCallPart args: {tool_part.args}")
-                print(f"ToolCallPart args type: {type(tool_part.args)}")
+                logger.debug(f"Created ToolCallPart: {tool_part}")
+                logger.debug(f"ToolCallPart args: {tool_part.args}")
+                logger.debug(f"ToolCallPart args type: {type(tool_part.args)}")
                 parts.append(tool_part)
 
         # Create usage metrics
@@ -288,13 +292,13 @@ class AnthropicAgentModel(AgentModel):
         tool_results_buffer = []  # Buffer to collect tool results
         
         for message in messages:
-            print(f"Mapping message: {message}")
-            print(f"Message type: {type(message)}")
-            print(f"Message parts: {message.parts}")
+            logger.debug(f"Mapping message: {message}")
+            logger.debug(f"Message type: {type(message)}")
+            logger.debug(f"Message parts: {message.parts}")
 
             if isinstance(message, ModelRequest):
                 for part in message.parts:
-                    print(f"Processing part: {part}")
+                    logger.debug(f"Processing part: {part}")
                     if isinstance(part, SystemPromptPart):
                         # Add system message as user instruction
                         mapped_messages.append({
