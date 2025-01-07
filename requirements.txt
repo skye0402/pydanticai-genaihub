@@ -1,7 +1,2 @@
-python_dotenv
 pydantic-ai
-generative-ai-hub-sdk[all]
-openai
-logfire[asyncpg]
-devtools
-asyncpg
+generative-ai-hub-sdk
