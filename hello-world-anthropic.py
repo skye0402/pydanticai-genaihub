@@ -4,9 +4,6 @@ import os
 from pydantic_ai import Agent
 from genai_hub_models.gah_anthropic import AnthropicModel
 
-# Configure for SAP GenAI Hub
-api_key = os.getenv('AICORE_CLIENT_SECRET')
-
 # Initialize the model with SAP GenAI Hub configuration
 llm = AnthropicModel(
     model_name="anthropic--claude-3.5-sonnet",

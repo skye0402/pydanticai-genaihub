@@ -2,3 +2,5 @@ python_dotenv
 pydantic-ai
 generative-ai-hub-sdk[all]
 openai
+logfire
+devtools

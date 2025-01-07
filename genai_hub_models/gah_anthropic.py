@@ -2,16 +2,15 @@ from __future__ import annotations as _annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, cast, overload, Union, Literal
-from json import dumps, loads
-from typing import Any, AsyncIterator, cast
+from typing import Any, AsyncIterator, cast, overload, Union, Literal, Sequence
+from json import loads, dumps
+from typing_extensions import assert_never
 
-from pydantic_ai import messages, result
+from pydantic_ai import result
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
-    RetryPromptPart,
     SystemPromptPart,
     TextPart,
     ToolCallPart,
@@ -20,9 +19,6 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import ModelSettings, EitherStreamedResponse, Model, AgentModel, check_allow_model_requests
 from pydantic_ai.usage import Usage
-from typing_extensions import assert_never
-
-from httpx import AsyncClient as AsyncHTTPClient
 from gen_ai_hub.proxy.native.amazon.clients import Session
 
 try:
@@ -119,12 +115,9 @@ class AnthropicModel(Model):
     @staticmethod
     def _map_tool_definition(f: ToolDefinition) -> dict:
         return {
-            'type': 'function',
-            'function': {
-                'name': f.name,
-                'description': f.description,
-                'parameters': f.parameters_json_schema,
-            },
+            'name': f.name,
+            'description': f.description,
+            'parameters': f.parameters_json_schema,
         }
 
 
@@ -152,113 +145,254 @@ class AnthropicAgentModel(AgentModel):
             A tuple of (response, usage)
         """
         print(f"Request messages: {messages}")
-        response = self._messages_create(messages[-1], False, model_settings)
+        response = self._messages_create(messages, False, model_settings)
         return self._process_response(response)
 
     async def request_stream(
         self, messages: list[ModelMessage], model_settings: ModelSettings | None
     ) -> EitherStreamedResponse:
-        response = self._messages_create(messages[-1], True, model_settings)
+        response = self._messages_create(messages, True, model_settings)
         return self._process_streamed_response(response)
 
-    @staticmethod
-    def _map_message(message: ModelMessage) -> dict | list[dict]:
-        """Map a ModelMessage to an Anthropic message format."""
-        print(f"Mapping message: {message}")
-        print(f"Message type: {type(message)}")
-        if isinstance(message, ModelRequest):
-            print(f"Message parts: {message.parts}")
-            mapped_messages = []
-            for part in message.parts:
-                print(f"Processing part: {part}")
-                if isinstance(part, SystemPromptPart):
-                    mapped_messages.append({'role': 'assistant', 'content': part.content})
-                elif isinstance(part, UserPromptPart):
-                    mapped_messages.append({'role': 'user', 'content': part.content})
-                elif isinstance(part, TextPart):
-                    mapped_messages.append({'role': 'assistant', 'content': part.content})
-                elif isinstance(part, ToolCallPart):
-                    mapped_messages.append({
-                        'role': 'assistant',
-                        'content': None,
-                        'tool_calls': [_map_tool_call(part)],
-                    })
-                elif isinstance(part, ToolReturnPart):
-                    mapped_messages.append({
-                        'role': 'assistant',
-                        'content': part.content,
-                    })
-                elif isinstance(part, RetryPromptPart):
-                    mapped_messages.append({'role': 'user', 'content': part.content})
-                else:
-                    assert_never(part)
-            print(f"Mapped messages: {mapped_messages}")
-            return mapped_messages
-        elif isinstance(message, ModelResponse):
-            return {'role': 'assistant', 'content': message.content}
-        else:
-            assert_never(message)
-    
     def _messages_create(
         self,
-        message: ModelMessage,
+        messages: list[ModelMessage],
         stream: bool,
         model_settings: ModelSettings | None,
-    ) -> Any:
-        """Create a chat completion request to the Anthropic API.
+    ) -> Message | AsyncIterator[MessageStreamEvent]:
+        """Create a message using the Anthropic API via AWS Bedrock.
 
         Args:
-            message: The message to send to the API
+            messages: The messages to send
             stream: Whether to stream the response
             model_settings: Optional model settings
 
         Returns:
-            The response from the API
+            The API response
         """
-        mapped = self._map_message(message)
-        request_messages = mapped if isinstance(mapped, list) else [mapped]
+        mapped_messages = self._map_messages(messages)
+        print(f"Creating message with: {mapped_messages}")
         
-        request_body = {
-            'messages': request_messages,
-            'max_tokens': 1000,  # Required by AWS Bedrock
-            'anthropic_version': 'bedrock-2023-05-31',  # Required by AWS Bedrock
-        }
-        
-        if model_settings is not None:
-            if model_settings.temperature is not None:
-                request_body['temperature'] = model_settings.temperature
-            if model_settings.max_tokens is not None:
-                request_body['max_tokens'] = model_settings.max_tokens
-        
-        print(f"Request body: {request_body}")
-        response = self.client.invoke_model(
-            body=dumps(request_body).encode(),
-            modelId=self.model_name,
-        )
-        
-        if stream:
-            return response['body']
-        else:
-            response_bytes = response['body'].read()
-            response_data = loads(response_bytes.decode())
-            print(f"Response data: {response_data}")
-            return response_data
+        # Convert mapped messages to the format expected by AWS Bedrock
+        messages = []
+        for msg in mapped_messages:
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
 
-    @staticmethod
-    def _process_response(response: dict) -> tuple[ModelResponse, result.Usage]:
-        """Process a non-streamed response, and prepare a message to return."""
-        content = response.get('content', [])
-        if isinstance(content, list) and len(content) > 0:
-            content = content[0].get('text', '')
+        # Prepare the converse API request
+        request_kwargs = {
+            "modelId": self.model_name,
+            "messages": messages,
+            "inferenceConfig": {
+                "temperature": 0.7,
+                "maxTokens": 1024,
+                "topP": 0.999
+            }
+        }
+
+        # Add tools if they are defined
+        if self.tools:
+            request_kwargs["toolConfig"] = {
+                "tools": [
+                    {
+                        "toolSpec": {
+                            "name": tool["name"],
+                            "description": tool["description"],
+                            "inputSchema": {
+                                "json": loads(dumps(tool["parameters"]))
+                            }
+                        }
+                    }
+                    for tool in self.tools
+                ]
+            }
+
+        print(f"Request kwargs: {request_kwargs}")
         
-        usage_data = response.get('usage', {})
-        usage = Usage()
-        usage.requests = 1
-        usage.request_tokens = usage_data.get('input_tokens', 0)
-        usage.response_tokens = usage_data.get('output_tokens', 0)
-        usage.total_tokens = usage.request_tokens + usage.response_tokens if usage.request_tokens is not None else None
+        # Make the API call through AWS Bedrock
+        try:
+            response = self.client.converse(**request_kwargs)
+            print(f"Response from Claude: {response}")
+            return response
+            
+        except Exception as e:
+            print(f"Error calling Claude: {str(e)}")
+            raise
+
+    def _process_response(
+        self, response: Any
+    ) -> tuple[ModelResponse, result.Usage]:
+        """Process a response from the Anthropic API.
+
+        Args:
+            response: The API response to process
+
+        Returns:
+            A tuple of (response, usage)
+        """
+        print(f"Processing response: {response}")
+
+        # Extract the response content
+        output = response.get("output", {})
+        message = output.get("message", {})
+        content_list = message.get("content", [])
         
-        return ModelResponse.from_text(content), usage
+        # Create response parts
+        parts = []
+
+        # Process each content item
+        for content in content_list:
+            if "text" in content:
+                parts.append(TextPart(content=content["text"]))
+            elif "toolUse" in content:
+                tool_use = content["toolUse"]
+                print(f"Processing tool use: {tool_use}")
+                print(f"Tool name: {tool_use['name']}")
+                print(f"Tool input: {tool_use['input']}")
+                print(f"Tool input type: {type(tool_use['input'])}")
+                
+                tool_part = ToolCallPart.from_raw_args(
+                    tool_use["name"],
+                    dumps(tool_use["input"]),  # Convert dict to JSON string
+                    tool_use.get("toolUseId", ""),
+                )
+                print(f"Created ToolCallPart: {tool_part}")
+                print(f"ToolCallPart args: {tool_part.args}")
+                print(f"ToolCallPart args type: {type(tool_part.args)}")
+                parts.append(tool_part)
+
+        # Create usage metrics
+        usage = Usage(
+            requests=1,
+            request_tokens=output.get("usage", {}).get("inputTokens", 0),
+            response_tokens=output.get("usage", {}).get("outputTokens", 0),
+            total_tokens=output.get("usage", {}).get("totalTokens", 0),
+            details={},
+        )
+
+        return ModelResponse(parts=parts), usage
+
+    def _map_messages(self, messages: list[ModelMessage]) -> list[dict[str, Any]]:
+        """Map a list of model messages to a list of Anthropic messages.
+
+        Args:
+            messages: The messages to map
+
+        Returns:
+            A list of Anthropic messages
+        """
+        mapped_messages = []
+        current_role = "user"  # Track the current role
+        tool_results_buffer = []  # Buffer to collect tool results
+        
+        for message in messages:
+            print(f"Mapping message: {message}")
+            print(f"Message type: {type(message)}")
+            print(f"Message parts: {message.parts}")
+
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    print(f"Processing part: {part}")
+                    if isinstance(part, SystemPromptPart):
+                        # Add system message as user instruction
+                        mapped_messages.append({
+                            "role": "user",
+                            "content": [{"text": f"Instructions: {part.content}"}]
+                        })
+                        # Add assistant acknowledgment
+                        mapped_messages.append({
+                            "role": "assistant", 
+                            "content": [{"text": "I understand and will follow these instructions."}]
+                        })
+                        current_role = "user"  # Next message should be user
+                    elif isinstance(part, UserPromptPart):
+                        # Add user message
+                        if current_role == "assistant":
+                            # If last message was assistant, this can be user
+                            mapped_messages.append({
+                                "role": "user",
+                                "content": [{"text": part.content}]
+                            })
+                            current_role = "user"
+                        else:
+                            # If last message was user, combine with previous
+                            if mapped_messages and mapped_messages[-1]["role"] == "user":
+                                mapped_messages[-1]["content"].append({"text": part.content})
+                            else:
+                                mapped_messages.append({
+                                    "role": "user",
+                                    "content": [{"text": part.content}]
+                                })
+                    elif isinstance(part, ToolReturnPart):
+                        # Collect tool results in the buffer
+                        tool_results_buffer.append({
+                            "toolResult": {
+                                "toolUseId": part.tool_call_id,
+                                "content": [{"text": dumps(part.content)}],
+                                "status": "success"
+                            }
+                        })
+
+                # If we have collected tool results, add them all in one message
+                if tool_results_buffer:
+                    if current_role == "assistant":
+                        # If last message was assistant, add as user
+                        mapped_messages.append({
+                            "role": "user",
+                            "content": tool_results_buffer
+                        })
+                        current_role = "user"
+                    else:
+                        # If last message was user, add as assistant
+                        mapped_messages.append({
+                            "role": "assistant",
+                            "content": tool_results_buffer
+                        })
+                        current_role = "assistant"
+                    tool_results_buffer = []  # Clear the buffer
+
+            elif isinstance(message, ModelResponse):
+                # Process response parts
+                content_list = []
+                for part in message.parts:
+                    if isinstance(part, TextPart):
+                        if part.content != "":
+                            content_list.append({"text": part.content})
+                    elif isinstance(part, ToolCallPart):
+                        content_list.append({
+                            "toolUse": {
+                                "toolUseId": part.tool_call_id,
+                                "name": part.tool_name,
+                                "input": loads(part.args_as_json_str())
+                            }
+                        })
+                if content_list:
+                    if current_role == "user":
+                        # If last message was user, add as assistant
+                        mapped_messages.append({
+                            "role": "assistant",
+                            "content": content_list
+                        })
+                        current_role = "assistant"
+                    else:
+                        # If last message was assistant, add as user
+                        mapped_messages.append({
+                            "role": "user",
+                            "content": content_list
+                        })
+                        current_role = "user"
+
+        # Ensure conversation ends with a user message
+        if mapped_messages and mapped_messages[-1]["role"] == "assistant":
+            mapped_messages.append({
+                "role": "user",
+                "content": [{"text": "Please continue."}]
+            })
+            current_role = "user"
+
+        return mapped_messages
 
     @staticmethod
     def _process_streamed_response(response: Any) -> EitherStreamedResponse:

@@ -10,9 +10,9 @@ from typing import Literal, Union, overload
 from httpx import AsyncClient as AsyncHTTPClient
 from typing_extensions import assert_never
 
-from pydantic_ai import UnexpectedModelBehavior, _utils, result
-from pydantic_ai._utils import guard_tool_call_id as _guard_tool_call_id
-from pydantic_ai.messages import (
+from .. import UnexpectedModelBehavior, _utils, result
+from .._utils import guard_tool_call_id as _guard_tool_call_id
+from ..messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -24,10 +24,10 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.result import Usage
-from pydantic_ai.settings import ModelSettings
-from pydantic_ai.tools import ToolDefinition
-from pydantic_ai.models import (
+from ..result import Usage
+from ..settings import ModelSettings
+from ..tools import ToolDefinition
+from . import (
     AgentModel,
     EitherStreamedResponse,
     Model,
@@ -36,12 +36,10 @@ from pydantic_ai.models import (
     cached_async_http_client,
     check_allow_model_requests,
 )
-from gen_ai_hub.proxy.native.openai import AsyncOpenAI
-from gen_ai_hub.proxy.core.utils import NOT_GIVEN
-from openai.types import ChatModel, chat
-try:
-    
 
+try:
+    from openai import NOT_GIVEN, AsyncOpenAI, AsyncStream
+    from openai.types import ChatModel, chat
     from openai.types.chat import ChatCompletionChunk
     from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 except ImportError as _import_error:
@@ -174,41 +172,32 @@ class OpenAIAgentModel(AgentModel):
 
     async def _completions_create(
         self, messages: list[ModelMessage], stream: bool, model_settings: ModelSettings | None
-    ) -> Union[chat.ChatCompletion, AsyncStream[ChatCompletionChunk]]:
-        kwargs = {}
-        if model_settings is not None:
-            if model_settings.temperature is not None:
-                kwargs['temperature'] = model_settings.temperature
-            if model_settings.max_tokens is not None:
-                kwargs['max_tokens'] = model_settings.max_tokens
-            if model_settings.top_p is not None:
-                kwargs['top_p'] = model_settings.top_p
-            if model_settings.presence_penalty is not None:
-                kwargs['presence_penalty'] = model_settings.presence_penalty
-            if model_settings.frequency_penalty is not None:
-                kwargs['frequency_penalty'] = model_settings.frequency_penalty
-            if model_settings.seed is not None:
-                kwargs['seed'] = model_settings.seed
+    ) -> chat.ChatCompletion | AsyncStream[ChatCompletionChunk]:
+        # standalone function to make it easier to override
+        if not self.tools:
+            tool_choice: Literal['none', 'required', 'auto'] | None = None
+        elif not self.allow_text_result:
+            tool_choice = 'required'
+        else:
+            tool_choice = 'auto'
 
-        # Filter out any NotGiven values from kwargs
-        kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, type(NOT_GIVEN))}
+        openai_messages = list(chain(*(self._map_message(m) for m in messages)))
 
-        # Add tools if they exist
-        if self.tools:
-            kwargs['tools'] = self.tools
-            kwargs['tool_choice'] = 'auto'
-
-        # Map messages and collect them into a list
-        mapped_messages = []
-        for m in messages:
-            mapped = list(self._map_message(m))  # Convert generator to list
-            mapped_messages.extend(mapped)
+        model_settings = model_settings or {}
 
         return await self.client.chat.completions.create(
-            messages=mapped_messages,
             model=self.model_name,
+            messages=openai_messages,
+            n=1,
+            parallel_tool_calls=True if self.tools else NOT_GIVEN,
+            tools=self.tools or NOT_GIVEN,
+            tool_choice=tool_choice or NOT_GIVEN,
             stream=stream,
-            **kwargs,
+            stream_options={'include_usage': True} if stream else NOT_GIVEN,
+            max_tokens=model_settings.get('max_tokens', NOT_GIVEN),
+            temperature=model_settings.get('temperature', NOT_GIVEN),
+            top_p=model_settings.get('top_p', NOT_GIVEN),
+            timeout=model_settings.get('timeout', NOT_GIVEN),
         )
 
     @staticmethod
@@ -268,11 +257,14 @@ class OpenAIAgentModel(AgentModel):
                     tool_calls.append(_map_tool_call(item))
                 else:
                     assert_never(item)
-            
+            message_param = chat.ChatCompletionAssistantMessageParam(role='assistant')
             if texts:
-                yield {'role': 'assistant', 'content': '\n\n'.join(texts)}
-            elif tool_calls:
-                yield {'role': 'assistant', 'content': None, 'tool_calls': tool_calls}
+                # Note: model responses from this model should only have one text item, so the following
+                # shouldn't merge multiple texts into one unless you switch models between runs:
+                message_param['content'] = '\n\n'.join(texts)
+            if tool_calls:
+                message_param['tool_calls'] = tool_calls
+            yield message_param
         else:
             assert_never(message)
 
@@ -280,24 +272,24 @@ class OpenAIAgentModel(AgentModel):
     def _map_user_message(cls, message: ModelRequest) -> Iterable[chat.ChatCompletionMessageParam]:
         for part in message.parts:
             if isinstance(part, SystemPromptPart):
-                yield {'role': 'system', 'content': part.content}
+                yield chat.ChatCompletionSystemMessageParam(role='system', content=part.content)
             elif isinstance(part, UserPromptPart):
-                yield {'role': 'user', 'content': part.content}
+                yield chat.ChatCompletionUserMessageParam(role='user', content=part.content)
             elif isinstance(part, ToolReturnPart):
-                yield {
-                    'role': 'tool',
-                    'content': str(part.content),  # Ensure content is a string
-                    'tool_call_id': _guard_tool_call_id(t=part, model_source='OpenAI'),
-                }
+                yield chat.ChatCompletionToolMessageParam(
+                    role='tool',
+                    tool_call_id=_guard_tool_call_id(t=part, model_source='OpenAI'),
+                    content=part.model_response_str(),
+                )
             elif isinstance(part, RetryPromptPart):
                 if part.tool_name is None:
-                    yield {'role': 'user', 'content': str(part.content)}  # Ensure content is a string
+                    yield chat.ChatCompletionUserMessageParam(role='user', content=part.model_response())
                 else:
-                    yield {
-                        'role': 'tool',
-                        'content': str(part.content),  # Ensure content is a string
-                        'tool_call_id': _guard_tool_call_id(t=part, model_source='OpenAI'),
-                    }
+                    yield chat.ChatCompletionToolMessageParam(
+                        role='tool',
+                        tool_call_id=_guard_tool_call_id(t=part, model_source='OpenAI'),
+                        content=part.model_response(),
+                    )
             else:
                 assert_never(part)
 
